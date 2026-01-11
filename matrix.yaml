@@ -162,6 +162,12 @@ globals:
     restore_value: false
     initial_value: "0"
 
+  # Debug intensity
+  - id: latest_intensity
+    type: int
+    restore_value: false
+    initial_value: "-1"
+
 script:
   - id: show_boot
     mode: restart
@@ -242,7 +248,12 @@ display:
         return;
       }
 
-      it.set_intensity((int) id(matrix_intensity).state);
+      int new_intensity = (int) id(matrix_intensity).state;
+      if (new_intensity != id(latest_intensity)) {
+        id(latest_intensity) = new_intensity;
+        it.intensity(new_intensity);
+        ESP_LOGI("matrix", "Intensity changed to %d", new_intensity);
+      }
 
       const int chips = atoi("${chips}");
       const int px_width = chips * 8;
