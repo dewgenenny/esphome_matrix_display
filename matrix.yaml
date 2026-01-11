@@ -87,6 +87,15 @@ api:
             id: set_idle_text
             message: !lambda "return message;"
 
+    # Set brightness
+    - action: set_brightness
+      variables:
+        brightness: int
+      then:
+        - number.set:
+            id: matrix_intensity
+            value: !lambda 'return brightness;'
+
 # ----------------------------
 # Hardware: MAX7219
 # ----------------------------
