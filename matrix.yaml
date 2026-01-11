@@ -1,0 +1,271 @@
+substitutions:
+  name: matrix
+  friendly_name: "Remote Matrix Display"
+  chips: "8"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: 600
+    then:
+      - script.execute: show_boot
+
+esp8266:
+  board: nodemcu
+  restore_from_flash: true
+
+logger:
+  level: DEBUG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  reboot_timeout: 5min
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret matrix_fallback_ap_password
+
+captive_portal:
+
+ota:
+  - platform: esphome
+    password: !secret matrix_ota_password
+
+web_server:
+  port: 80
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(active_until_ms) == 0) return;
+          if (id(active_text).size() == 0) return;
+
+          // Expired?
+          if ((int32_t)(millis() - id(active_until_ms)) >= 0) {
+            ESP_LOGI("matrix", "Active message expired. Reverting to idle.");
+            id(active_text) = "";
+            id(active_until_ms) = 0;
+            id(active_priority) = 0;
+            id(scroll_x) = 0;
+          }
+
+
+api:
+  encryption:
+    key: !secret matrix_api_key
+  reboot_timeout: 0s
+
+  # ESPHome 2025.12+: custom actions (callable from Home Assistant)
+  actions:
+    # Push a message with TTL + priority
+    - action: show_message
+      variables:
+        message: string
+        ttl_seconds: int
+        priority: int
+      then:
+        - script.execute:
+            id: enqueue_message
+            message: !lambda "return message;"
+            ttl_seconds: !lambda "return ttl_seconds;"
+            priority: !lambda "return priority;"
+
+    # Set idle text (what shows when no active message)
+    - action: set_idle
+      variables:
+        message: string
+      then:
+        - script.execute:
+            id: set_idle_text
+            message: !lambda "return message;"
+
+# ----------------------------
+# Hardware: MAX7219
+# ----------------------------
+spi:
+  clk_pin: D5
+  mosi_pin: D7
+
+font:
+  - file: "pixelmix.ttf"
+    id: digit_font
+    size: 8
+
+number:
+  - platform: template
+    id: matrix_intensity
+    name: "${friendly_name} Brightness"
+    min_value: 0
+    max_value: 15
+    step: 1
+    restore_value: true
+    initial_value: 8
+    optimistic: true
+
+switch:
+  - platform: template
+    id: matrix_enabled
+    name: "${friendly_name} Enabled"
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    on_turn_off:
+      then:
+        - script.execute: clear_message
+    on_turn_on:
+      then:
+        - script.execute: show_boot
+
+# ----------------------------
+# Message system state
+# ----------------------------
+globals:
+  # Active message
+  - id: active_text
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: active_until_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: active_priority
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  # Idle text
+  - id: idle_text
+    type: std::string
+    restore_value: false
+    initial_value: '"READY"'
+
+  # Scroll state
+  - id: scroll_x
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+script:
+  - id: show_boot
+    mode: restart
+    then:
+      - lambda: |-
+          id(active_text) = "BOOT";
+          id(active_priority) = 0;
+          id(active_until_ms) = millis() + 5000;
+          id(scroll_x) = 0;
+
+  - id: set_idle_text
+    mode: restart
+    parameters:
+      message: string
+    then:
+      - lambda: |-
+          std::string t = message;
+          if (t.size() == 0) return;
+          id(idle_text) = t;
+
+  - id: clear_message
+    mode: restart
+    then:
+      - lambda: |-
+          id(active_text) = "";
+          id(active_until_ms) = 0;
+          id(active_priority) = 0;
+          id(scroll_x) = 0;
+
+  - id: enqueue_message
+    mode: restart
+    parameters:
+      message: string
+      ttl_seconds: int
+      priority: int
+    then:
+      - lambda: |-
+          std::string t = message;
+          if (t.empty()) return;
+
+          int ttl = ttl_seconds;
+          if (ttl <= 0) ttl = 30;
+          if (ttl > 3600) ttl = 3600;
+
+          // Expiry test: >= 0 is the correct deadline check
+          bool expired = (id(active_until_ms) != 0) && ((int32_t)(millis() - id(active_until_ms)) >= 0);
+
+          bool will_replace =
+              (priority >= id(active_priority)) ||
+              expired ||
+              (id(active_text).size() == 0);
+
+          ESP_LOGI("matrix",
+                   "show_message rx='%s' ttl=%d prio=%d cur_prio=%d cur_len=%d expired=%d will_replace=%d",
+                   t.c_str(), ttl, priority, id(active_priority), (int)id(active_text).size(),
+                   (int)expired, (int)will_replace);
+
+          if (!will_replace) return;
+
+          uint32_t now = millis();
+          id(active_text) = t;
+          id(active_priority) = priority;
+          id(active_until_ms) = now + (uint32_t)ttl * 1000;
+          id(scroll_x) = 0;
+
+          ESP_LOGI("matrix", "ACTIVE SET now=%u until=%u (in %d sec)", now, id(active_until_ms), ttl);
+
+
+display:
+  - platform: max7219digit
+    cs_pin: D4
+    num_chips: ${chips}
+    intensity: 0
+    update_interval: 60ms
+    lambda: |-
+      if (!id(matrix_enabled).state) {
+        it.clear();
+        return;
+      }
+
+      it.set_intensity((int) id(matrix_intensity).state);
+
+      const int chips = atoi("${chips}");
+      const int px_width = chips * 8;
+
+      // Pick active vs idle text
+      bool active_valid = (id(active_text).size() > 0);
+      bool active_expired = (id(active_until_ms) != 0) && ((int32_t)(millis() - id(active_until_ms)) >= 0);
+
+      std::string text;
+      if (active_valid && !active_expired) {
+        text = id(active_text);
+      }  else {
+           text = id(idle_text);
+           id(active_text) = "";
+           id(active_priority) = 0;
+           id(active_until_ms) = 0;
+           }
+
+      // Scrolling (approx)
+      int approx_char_w = 6;               // good enough for pixelmix size ~8
+      int text_px = (int) text.size() * approx_char_w;
+
+      it.clear();
+
+      if (text_px <= px_width) {
+        id(scroll_x) = 0;
+        it.print(0, 0, id(digit_font), text.c_str());
+      } else {
+        int gap = 10;
+        int total = text_px + gap;
+        int x = - (id(scroll_x) % total);
+
+        it.print(x, 0, id(digit_font), text.c_str());
+        id(scroll_x) += 1;                 // scroll speed (px per frame)
+      }
